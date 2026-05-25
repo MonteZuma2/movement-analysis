@@ -1,0 +1,17 @@
+# Single-camera (intrinsics only) calibration — demo, not a real calibration
+# Replace with actual checkerboard calibration before clinical use
+camera_matrix_l:
+  rows: 3
+  cols: 3
+  data:
+    - 1500.0   0    960.0
+    - 0        1500.0 540.0
+    - 0        0      1.0
+dist_coeffs_l:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+camera_matrix_r: null
+R: null
+T: null
+Q: null

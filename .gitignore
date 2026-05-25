@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+session*/output/
+*.task
+sessions/*/output/
+logs/
+videos/
+output/
