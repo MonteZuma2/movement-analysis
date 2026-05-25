@@ -1,6 +1,37 @@
-numpy>=1.24
-Pillow>=10.0
-opencv-python>=4.8
-scipy>=1.11
-ezc3d>=1.5
+# Movement Analysis — dependencies
+#
+# Install one of the following profiles depending on your required backend:
+#
+# Accurate (RTMPose + OpenMMLab):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   pip install openmim
+#   mim install mmengine "mmcv>=2.0.0"
+#   mim install mmdet mmpose
+#   pip install opencv-python numpy scipy pyyaml ezc3d
+#
+# Practical (YOLO-Pose):
+#   pip install ultralytics opencv-python numpy scipy pyyaml ezc3d
+#
+# Legacy fallback (MediaPipe):
+#   pip install mediapipe opencv-python numpy scipy pyyaml ezc3d
+
+# Core
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
 pyyaml>=6.0
+ezc3d>=1.5.0
+
+# Optional — RTMPose / OpenMMLab (preferred clinical backend)
+# torch torchvision  # install manually with your CUDA version
+openmim
+mmengine
+mmcv>=2.0.0
+mmdet
+mmpose
+
+# Optional — Ultralytics YOLO-Pose (practical fallback)
+ultralytics
+
+# Optional — MediaPipe Pose (legacy fallback)
+mediapipe

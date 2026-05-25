@@ -1,0 +1,48 @@
+# pose_tracking.yaml
+# Model configuration for Movement Analysis pose estimation backends.
+# Pin exact versions once your environment is confirmed working.
+
+backends:
+  rtmpose:
+    description: "RTMPose + RTMDet two-stage pipeline — preferred clinical backend"
+    tiers:
+      fast:
+        pose_config: "configs/body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py"
+        pose_checkpoint: "https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/rtmpose/coco/rtmpose-s_simcc-coco-popart_256x192-b59268d1_20230109.pth"
+        det_config: "configs/rtmdet/rtmdet_m_640-8xb32_coco-person.py"
+        det_checkpoint: "https://download.openmmlab.com/mmdetection/v2.0/rtmdet/rtmdet_m_640-8xb32_coco-person/rtmdet_m_640-8xb32_coco-person_20220731_155618-b5fbdbae.pth"
+      balanced:
+        pose_config: "configs/body_2d_keypoint/rtmpose/coco/rtmpose-l_8xb256-420e_coco-256x192.py"
+        pose_checkpoint: "https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/rtmpose/coco/rtmpose-l_simcc-coco-popart_256x192-b59268d1_20230109.pth"
+        det_config: "configs/rtmdet/rtmdet_m_640-8xb32_coco-person.py"
+        det_checkpoint: "https://download.openmmlab.com/mmdetection/v2.0/rtmdet/rtmdet_m_640-8xb32_coco-person/rtmdet_m_640-8xb32_coco-person_20220731_155618-b5fbdbae.pth"
+      accurate:
+        pose_config: "configs/body_2d_keypoint/rtmpose/coco/rtmpose-x_8xb256-700e_coco-384x288.py"
+        pose_checkpoint: "https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/rtmpose/coco/rtmpose-x_simcc-coco-popart_384x288-b59268d1_20230109.pth"
+        det_config: "configs/rtmdet/rtmdet_m_640-8xb32_coco-person.py"
+        det_checkpoint: "https://download.openmmlab.com/mmdetection/v2.0/rtmdet/rtmdet_m_640-8xb32_coco-person/rtmdet_m_640-8xb32_coco-person_20220731_155618-b5fbdbae.pth"
+
+  yolo:
+    description: "Ultralytics YOLO-Pose — practical fallback, easy install"
+    tiers:
+      fast: "yolo11s-pose.pt"
+      balanced: "yolo11m-pose.pt"
+      accurate: "yolo11x-pose.pt"
+
+  mediapipe:
+    description: "MediaPipe Pose — legacy fallback backend"
+    model_path: "pose_landmarker_full.task"
+
+quality:
+  thresholds:
+    excellent: 0.90
+    good: 0.80
+    caution: 0.65
+    poor: 0.50
+  critical_joints:
+    trunk: [5, 6, 11, 12]
+    left_lower_limb: [11, 13, 15]
+    right_lower_limb: [12, 14, 16]
+    all_lower_limb: [11, 12, 13, 14, 15, 16]
+  conf_thresholds:
+    joint_visible: 0.25

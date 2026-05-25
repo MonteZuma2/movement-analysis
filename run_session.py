@@ -1,17 +1,21 @@
-"""GaitLab pipeline — dual-camera or single-camera markerless gait analysis.
+"""Movement Analysis pipeline — dual/single-camera markerless movement analysis.
 
 Modes:
-  dual   — Two sync'd cameras → MMPose 2D → DLT triangulation → 3D angles + C3D
-  single — One camera (sagittal view) → MMPose 2D → 2D sagittal angles → CSV/JSON only
+  dual   — Two sync'd cameras → pose 2D → DLT triangulation → 3D angles + C3D
+  single — One camera (sagittal view) → pose 2D → 2D sagittal angles → CSV/JSON only
+
+Supports: gait, squats, step-downs, jump-downs, lunges, sit-to-stand, balance tasks,
+and any other clinical functional movements.
 
 A session consists of:
   1. Load calibration (projection matrices P_l, P_r for dual; intrinsics for single)
   2. Extract frames from video(s)
-  3. Run MMPose 2D keypoint detection on each frame (pair)
+  3. Run pose detection on each frame (or frame pair)
   4. (dual only) Triangulate to 3D trajectories
   5. Smooth/interpolate
   6. Compute joint angles
   7. Export C3D + CSV + report JSON (dual) or CSV + report JSON (single)
+  8. Export tracking_quality.json and optional debug overlay video
 """
 
 from __future__ import annotations
@@ -19,13 +23,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
 import cv2
 
-from keypoints.detect import detect_keypoints, JOINT_NAMES
+from keypoints.detect import detect_keypoints, detect_pose, JOINT_NAMES, PoseDetection
 from geometry.triangulate import (
     load_calibration,
     triangulate_frame,
@@ -40,6 +45,13 @@ from kinematics.export import (
     export_trajectories_npz,
     export_report,
 )
+from keypoints.quality import (
+    assess_frame,
+    assess_session,
+    assessment_to_dict,
+    CRITICAL_JOINTS,
+)
+from keypoints.visualize import write_debug_video
 
 logger = logging.getLogger("movement_analysis")
 
@@ -53,6 +65,7 @@ def extract_frames_single(video_path: str, target_fps: float = 120) -> tuple[lis
 
     Returns:
         frames: list of (frame_idx, image)
+        frame_indices: list of original frame indices
         actual_fps: detected video FPS
     """
     cap = cv2.VideoCapture(video_path)
@@ -120,47 +133,73 @@ def extract_frames_dual(
 
 
 # =============================================================================
-# Keypoint detection — shared
+# Keypoint detection — shared (preserves API + enriches with PoseDetection)
 # =============================================================================
 
 def detect_frames_single(
     frames: list,
     conf_threshold: float = 0.3,
-) -> list:
-    """Run MMPose on single-camera frames. Returns list of (17, 2) keypoint arrays."""
-    kps = []
+) -> tuple[list[np.ndarray], list[PoseDetection]]:
+    """Run pose detection on single-camera frames.
+
+    Returns:
+        keypoint_arrays: list of (17, 2) keypoint arrays (legacy format)
+        pose_detections: list of PoseDetection objects with per-frame metadata
+    """
+    keypoint_arrays = []
+    pose_detections = []
     total = len(frames)
+
     for i, (fi, frame) in enumerate(frames):
         if i % 10 == 0:
             logger.info(f"  keypoints: {i}/{total}")
-        result = detect_keypoints(frame, conf_threshold)
+        result = detect_pose(frame, conf_threshold)
         if result is None:
-            kps.append(np.full((17, 2), np.nan))
+            keypoint_arrays.append(np.full((17, 2), np.nan))
+            pose_detections.append(None)
         else:
-            kps.append(result[0])
-    return kps
+            keypoint_arrays.append(result.keypoints)
+            pose_detections.append(result)
+
+    return keypoint_arrays, pose_detections
 
 
 def detect_frames_dual(
     frames_l, frames_r,
     conf_threshold: float = 0.3,
-) -> tuple[list, list]:
-    """Run MMPose on dual-camera frame pairs."""
-    kps_l = []
-    kps_r = []
+) -> tuple[list[np.ndarray], list[np.ndarray], list[PoseDetection], list[PoseDetection]]:
+    """Run pose detection on dual-camera frame pairs.
+
+    Returns:
+        keypoint_arrays_l, keypoint_arrays_r: lists of (17, 2) arrays
+        pose_detections_l, pose_detections_r: PoseDetection objects
+    """
+    kps_l, kps_r = [], []
+    pd_l, pd_r = [], []
     total = len(frames_l)
+
     for i, ((fi, frame_l), (fi_r, frame_r)) in enumerate(zip(frames_l, frames_r)):
         if i % 10 == 0:
             logger.info(f"  keypoints: {i}/{total}")
-        result_l = detect_keypoints(frame_l, conf_threshold)
-        result_r = detect_keypoints(frame_r, conf_threshold)
-        if result_l is None or result_r is None:
+
+        res_l = detect_pose(frame_l, conf_threshold)
+        res_r = detect_pose(frame_r, conf_threshold)
+
+        if res_l is None:
             kps_l.append(np.full((17, 2), np.nan))
-            kps_r.append(np.full((17, 2), np.nan))
+            pd_l.append(None)
         else:
-            kps_l.append(result_l[0])
-            kps_r.append(result_r[0])
-    return kps_l, kps_r
+            kps_l.append(res_l.keypoints)
+            pd_l.append(res_l)
+
+        if res_r is None:
+            kps_r.append(np.full((17, 2), np.nan))
+            pd_r.append(None)
+        else:
+            kps_r.append(res_r.keypoints)
+            pd_r.append(res_r)
+
+    return kps_l, kps_r, pd_l, pd_r
 
 
 # =============================================================================
@@ -194,209 +233,18 @@ def triangulate_all(
 # 2D smoothing (single mode)
 # =============================================================================
 
-def smooth_2d_sequence(
-    keypoints_seq: list,   # list of (17, 2)
-    window: int = 7,
-    fs: float = 120.0,
-) -> list:
-    """Savitzky-Golay smooth a list of 2D keypoint arrays over time.
-
-    Operates on each joint and axis separately.
-    """
-    from scipy.signal import savgol_filter
-
-    n_frames = len(keypoints_seq)
-    n_joints = keypoints_seq[0].shape[0]
-
-    # Stack into (n_frames, 17, 2)
-    stacked = np.stack(keypoints_seq, axis=0)  # (n_frames, 17, 2)
-    smoothed = stacked.copy()
-
-    pad = window // 2
-
-    for j in range(n_joints):
-        for ax in range(2):
-            series = stacked[:, j, ax]
-            mask = ~np.isnan(series)
-
-            if mask.sum() < poly_order_check(window):
-                continue
-
-            x = np.arange(n_frames)
-            valid = series[mask]
-            valid_x = x[mask]
-            if len(valid_x) < 2:
-                continue
-
-            interp = np.interp(x, valid_x, valid)
-            padded = np.concatenate([[interp[0]] * pad, interp, [interp[-1]] * pad])
-
-            try:
-                filtered = savgol_filter(padded, window, min(2, window - 1))
-                smoothed[:, j, ax] = filtered[pad:-pad]
-            except Exception:
-                smoothed[:, j, ax] = interp
-
-    return [smoothed[i] for i in range(n_frames)]
-
-
-def poly_order_check(window: int) -> int:
-    """Return minimum valid samples for SG filter."""
-    return window
-
-
-# =============================================================================
-# Single-camera session
-# =============================================================================
-
-def run_session_single(
-    session_dir: Path,
-    calibration_path: str,   # intrinsics only YAML
-    video: str,
-    fps: float = None,
-    conf_threshold: float = 0.3,
-    smooth_window: int = 7,
-    output_dir: Path = None,
-) -> dict:
-    """Run single-camera sagittal-plane gait analysis.
-
-    No 3D reconstruction. Outputs CSV + report JSON only.
-    """
-    session_id = session_dir.name
-    start = datetime.now()
-    logger.info(f"=== GaitLab session (single): {session_id} ===")
-
-    # ── 1. Load calibration (intrinsics only) ───────────────────────────────
-    logger.info("Loading calibration (intrinsics)...")
-    try:
-        P_l, P_r, mtx_l, mtx_r, Q = load_calibration(calibration_path)
-    except Exception:
-        logger.warning("No calibration file — proceeding without camera parameters")
-        mtx_l = None
-
-    # ── 2. Extract frames ────────────────────────────────────────────────────
-    logger.info("Extracting frames...")
-    frames, frame_indices, actual_fps = extract_frames_single(video, target_fps=120)
-    n_frames = len(frames)
-    if n_frames == 0:
-        raise RuntimeError("No frames extracted — check video file")
-    logger.info(f"  {n_frames} frames at {actual_fps:.1f} fps")
-
-    # ── 3. 2D keypoint detection ─────────────────────────────────────────────
-    logger.info("Running MMPose 2D keypoint detection...")
-    kps = detect_frames_single(frames, conf_threshold)
-    logger.info(f"  Detection complete: {n_frames} frames")
-
-    # ── 4. Interpolate gaps ──────────────────────────────────────────────────
-    from scipy.signal import savgol_filter
-
-    def interp_and_smooth(seq, window):
-        n = len(seq)
-        out = []
-        pad = window // 2
-        for j in range(17):
-            for ax in range(2):
-                series = np.array([seq[f][j, ax] for f in range(n)])
-                mask = ~np.isnan(series)
-                x = np.arange(n)
-                if mask.sum() < 3:
-                    out.append(np.full(n, np.nan))
-                    continue
-                interp = np.interp(x, x[mask], series[mask])
-                padded = np.concatenate([[interp[0]]*pad, interp, [interp[-1]]*pad])
-                try:
-                    filtered = savgol_filter(padded, window, min(2, window-1))
-                    out.append(filtered[pad:-pad])
-                except Exception:
-                    out.append(interp)
-        # Reconstruct (n_frames, 17, 2)
-        result = np.stack([np.stack([out[c*17 + j] for j in range(17)], axis=0) for c in range(2)], axis=2)
-        result = result.transpose(1, 2, 0)  # (17, 2, n_frames) → (17, 2, n_frames) wait
-        # Actually simpler: just return list of smoothed arrays
-        return [np.array([[out[ax*17 + j][f] for ax in range(2)] for j in range(17)]) for f in range(n)]
-
-    # Simple per-joint interpolation
-    kps_filled = _fill_keypoint_gaps(kps, max_gap=5)
-    kps_smooth = _smooth_keypoints_2d(kps_filled, window=smooth_window, fs=actual_fps)
-    logger.info("  Smoothing complete")
-
-    # ── 4b. Render skeleton video ─────────────────────────────────────────────
-    if output_dir is None:
-        output_dir = session_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("  Rendering skeleton video...")
-    from utils.visualize import visualize_keypoints
-    raw_frames = [f for _, f in frames]   # list of BGR uint8 frames
-    skeleton_path = str(output_dir / "skeleton.mp4")
-    visualize_keypoints(raw_frames, kps_smooth, skeleton_path, fps=actual_fps)
-    logger.info(f"  Skeleton video: {skeleton_path}")
-
-    # ── 5. Compute 2D sagittal angles ────────────────────────────────────────
-    logger.info("Computing sagittal-plane joint angles...")
-    angles = compute_all_angles_2d(kps_smooth)
-
-    # Estimate walking speed if calibration available
-    if mtx_l is not None:
-        speed, _ = estimate_gait_speed_2d(
-            kps_smooth,
-            focal_length_px=mtx_l[0, 0],
-            subject_distance_m=3.0,   # <-- set based on your setup
-        )
-    else:
-        speed = None
-
-    angle_sum = angle_summary(angles)
-    logger.info("  Angles computed: hip/knee/ankle (sagittal)")
-
-    # ── 6. Export outputs ────────────────────────────────────────────────────
-    logger.info("Exporting outputs...")
-    csv_path = export_angles_csv(angles, str(output_dir / "angles.csv"))
-    report_path = _export_report_single(angles, speed, actual_fps, n_frames, str(output_dir / "report.json"))
-
-    elapsed = (datetime.now() - start).total_seconds()
-    logger.info(f"=== Session complete in {elapsed:.1f}s ===")
-    logger.info(f"  CSV: {csv_path}")
-    logger.info(f"  JSON: {report_path}")
-
-    return {
-        "status": "success",
-        "mode": "single",
-        "session_id": session_id,
-        "duration_s": round(elapsed, 1),
-        "n_frames": n_frames,
-        "fps": round(actual_fps, 1),
-        "outputs": {
-            "csv": csv_path,
-            "report_json": report_path,
-            "skeleton_mp4": skeleton_path,
-        },
-        "gait_metrics": angle_sum,
-    }
-
-
 def _fill_keypoint_gaps(
     kps: list,
     max_gap: int = 5,
 ) -> list:
-    """Linearly interpolate short gaps in a 2D keypoint sequence.
-
-    Args:
-        kps: list of (17, 2) arrays, one per frame.
-        max_gap: maximum gap length to interpolate (frames).
-
-    Returns:
-        list of (17, 2) arrays with short gaps filled.
-    """
+    """Linearly interpolate short gaps in a 2D keypoint sequence."""
     n_frames = len(kps)
-    n_joints = kps[0].shape[0]  # 17
+    n_joints = kps[0].shape[0]
 
-    # out[j][ax] = interpolated series of length n_frames
     out = [[None, None] for _ in range(n_joints)]
 
     for j in range(n_joints):
         for ax in range(2):
-            # Build series for this joint and axis across all frames
             series = np.array(
                 [kps[f][j, ax] if not np.isnan(kps[f][j, ax]) else np.nan for f in range(n_frames)],
                 dtype=float
@@ -411,18 +259,14 @@ def _fill_keypoint_gaps(
                 continue
 
             interp = series.copy()
-            # Linear interpolation across all NaN positions
             all_nan = np.isnan(series)
             if all_nan.all():
                 out[j][ax] = series
                 continue
 
-            # Interpolate entire series (handles long and short gaps)
             interp = np.interp(x, valid_x, valid_y)
-
             out[j][ax] = interp
 
-    # Reconstruct: (n_frames, 17, 2)
     result = np.zeros((n_frames, n_joints, 2), dtype=float)
     for j in range(n_joints):
         for ax in range(2):
@@ -442,7 +286,7 @@ def _smooth_keypoints_2d(
     n_frames = len(kps)
     n_joints = kps[0].shape[0]
 
-    stacked = np.stack(kps, axis=0)   # (n_frames, 17, 2)
+    stacked = np.stack(kps, axis=0)
     smoothed = stacked.copy()
     pad = window // 2
 
@@ -450,7 +294,6 @@ def _smooth_keypoints_2d(
         for ax in range(2):
             series = stacked[:, j, ax].copy()
             mask = ~np.isnan(series)
-
             x = np.arange(n_frames)
             valid_x = x[mask]
             valid_y = series[mask]
@@ -470,17 +313,242 @@ def _smooth_keypoints_2d(
     return [smoothed[f] for f in range(n_frames)]
 
 
+# =============================================================================
+# Quality tracking helpers
+# =============================================================================
+
+def _compute_quality_frame(
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    frame_shape,
+) -> dict:
+    """Produce a JSON-serializable frame quality dict for tracking_quality.json."""
+    from keypoints.quality import assess_frame as _assess
+
+    fq = _assess(keypoints, scores, frame_shape)
+    return {
+        "visible_ratio": round(fq.visible_ratio, 4),
+        "trunk_ratio": round(fq.trunk_ratio, 4),
+        "left_ll_ratio": round(fq.left_ll_ratio, 4),
+        "right_ll_ratio": round(fq.right_ll_ratio, 4),
+        "mean_ll_confidence": round(fq.mean_ll_confidence, 4),
+        "bbox_area_pct": round(fq.bbox_area_pct, 2),
+        "feet_outside_frame": fq.feet_outside_frame,
+        "low_ll_confidence": fq.low_ll_confidence,
+    }
+
+
+def _quality_report_path(output_dir: Path) -> Path:
+    return output_dir / "tracking_quality.json"
+
+
+def _run_quality_assessment(
+    pose_detections: list[PoseDetection | None],
+    raw_frames: list[np.ndarray],
+    output_dir: Path,
+    debug_overlay: bool = False,
+    fps: float = 30.0,
+) -> dict:
+    """Run quality assessment and write tracking_quality.json.
+
+    Also writes debug_pose_overlay.mp4 if debug_overlay=True.
+    """
+    frame_qualities = []
+    interpolation_counts = {i: 0 for i in range(17)}
+
+    for i, pd in enumerate(pose_detections):
+        if pd is None or pd.keypoints is None:
+            # All-NaN frame
+            shape = raw_frames[i].shape if i < len(raw_frames) else (720, 1280, 3)
+            fake_kps = np.full((17, 2), np.nan)
+            fake_scores = np.zeros(17)
+            fq_dict = _compute_quality_frame(fake_kps, fake_scores, shape)
+        else:
+            fq_dict = _compute_quality_frame(pd.keypoints, pd.scores, pd.keypoints.shape)
+            # Count interpolated joints (score == 0 means NaN'd due to confidence)
+            for j in range(17):
+                if pd.scores[j] == 0 and not np.isnan(pd.keypoints[j, 0]):
+                    interpolation_counts[j] += 1
+
+        frame_qualities.append(fq_dict)
+
+    # Longest missing streak per joint
+    total_frames = len(pose_detections)
+    assessment = assess_session(frame_qualities, interpolation_counts, total_frames)
+    assessment_dict = assessment_to_dict(assessment)
+
+    # Per-frame details
+    assessment_dict["frame_details"] = [
+        {**fq, "frame": i} for i, fq in enumerate(frame_qualities)
+    ]
+
+    # Write JSON
+    report_path = _quality_report_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w") as f:
+        json.dump(assessment_dict, f, indent=2)
+    logger.info(f"  Tracking quality: {assessment.quality_grade} — {report_path}")
+
+    # Debug overlay video
+    if debug_overlay:
+        debug_path = str(output_dir / "debug_pose_overlay.mp4")
+        logger.info(f"  Writing debug overlay: {debug_path}")
+
+        # Build pose_detection tuples for write_debug_video
+        pd_tuples = []
+        for pd in pose_detections:
+            if pd is None:
+                fake = PoseDetection(
+                    keypoints=np.full((17, 2), np.nan),
+                    scores=np.zeros(17),
+                    bbox=None,
+                    bbox_score=None,
+                    backend="none",
+                )
+                pd_tuples.append((fake.keypoints, fake.scores, fake.bbox, fake.backend))
+            else:
+                pd_tuples.append((pd.keypoints, pd.scores, pd.bbox, pd.backend))
+
+        write_debug_video(
+            frames=raw_frames,
+            pose_detections=pd_tuples,
+            output_path=debug_path,
+            fps=fps,
+            frame_qualities=frame_qualities,
+            quality_grade=assessment.quality_grade,
+        )
+        logger.info(f"  Debug overlay written: {debug_path}")
+
+    return assessment_dict
+
+
+# =============================================================================
+# Single-camera session
+# =============================================================================
+
+def run_session_single(
+    session_dir: Path,
+    calibration_path: str,
+    video: str,
+    fps: float = None,
+    conf_threshold: float = 0.3,
+    smooth_window: int = 7,
+    output_dir: Path = None,
+    debug_overlay: bool = False,
+) -> dict:
+    """Run single-camera sagittal-plane movement analysis.
+
+    No 3D reconstruction. Outputs CSV + report JSON + tracking_quality.json
+    + optional skeleton overlay + optional debug overlay video.
+    """
+    session_id = session_dir.name
+    start = datetime.now()
+    logger.info(f"=== Movement Analysis session (single): {session_id} ===")
+
+    # ── 1. Load calibration (intrinsics only) ─────────────────────────────────
+    logger.info("Loading calibration (intrinsics)...")
+    try:
+        P_l, P_r, mtx_l, mtx_r, Q = load_calibration(calibration_path)
+    except Exception:
+        logger.warning("No calibration file — proceeding without camera parameters")
+        mtx_l = None
+
+    # ── 2. Extract frames ────────────────────────────────────────────────────
+    logger.info("Extracting frames...")
+    frames, frame_indices, actual_fps = extract_frames_single(video, target_fps=120)
+    n_frames = len(frames)
+    if n_frames == 0:
+        raise RuntimeError("No frames extracted — check video file")
+    logger.info(f"  {n_frames} frames at {actual_fps:.1f} fps")
+
+    # ── 3. 2D keypoint detection ─────────────────────────────────────────────
+    logger.info("Running pose detection...")
+    kps, pose_detections = detect_frames_single(frames, conf_threshold)
+    logger.info(f"  Detection complete: {n_frames} frames")
+
+    raw_frames = [f for _, f in frames]
+
+    # ── 3b. Tracking quality assessment ─────────────────────────────────────
+    logger.info("Assessing tracking quality...")
+    output_dir = output_dir or session_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    quality_dict = _run_quality_assessment(
+        pose_detections, raw_frames, output_dir,
+        debug_overlay=debug_overlay, fps=actual_fps,
+    )
+    quality_grade = quality_dict.get("quality_grade", "unknown")
+
+    # ── 4. Interpolate gaps + smooth ────────────────────────────────────────
+    kps_filled = _fill_keypoint_gaps(kps, max_gap=5)
+    kps_smooth = _smooth_keypoints_2d(kps_filled, window=smooth_window, fs=actual_fps)
+    logger.info("  Smoothing complete")
+
+    # ── 4b. Render skeleton video ─────────────────────────────────────────────
+    logger.info("  Rendering skeleton video...")
+    from utils.visualize import visualize_keypoints
+    skeleton_path = str(output_dir / "skeleton.mp4")
+    visualize_keypoints(raw_frames, kps_smooth, skeleton_path, fps=actual_fps)
+    logger.info(f"  Skeleton video: {skeleton_path}")
+
+    # ── 5. Compute 2D sagittal angles ────────────────────────────────────────
+    logger.info("Computing sagittal-plane joint angles...")
+    angles = compute_all_angles_2d(kps_smooth)
+
+    if mtx_l is not None:
+        speed, _ = estimate_gait_speed_2d(
+            kps_smooth,
+            focal_length_px=mtx_l[0, 0],
+            subject_distance_m=3.0,
+        )
+    else:
+        speed = None
+
+    angle_sum = angle_summary(angles)
+    logger.info("  Angles computed: hip/knee/ankle (sagittal)")
+
+    # ── 6. Export outputs ────────────────────────────────────────────────────
+    logger.info("Exporting outputs...")
+    csv_path = export_angles_csv(angles, str(output_dir / "angles.csv"))
+    report_path = _export_report_single(
+        angles, speed, actual_fps, n_frames, quality_grade, str(output_dir / "report.json")
+    )
+
+    elapsed = (datetime.now() - start).total_seconds()
+    logger.info(f"=== Session complete in {elapsed:.1f}s ===")
+    logger.info(f"  CSV: {csv_path}")
+    logger.info(f"  JSON: {report_path}")
+    logger.info(f"  Quality grade: {quality_grade}")
+
+    return {
+        "status": "success",
+        "mode": "single",
+        "session_id": session_id,
+        "duration_s": round(elapsed, 1),
+        "n_frames": n_frames,
+        "fps": round(actual_fps, 1),
+        "outputs": {
+            "csv": csv_path,
+            "report_json": report_path,
+            "skeleton_mp4": skeleton_path,
+            "tracking_quality_json": str(_quality_report_path(output_dir)),
+        },
+        "gait_metrics": angle_sum,
+        "tracking_quality_grade": quality_grade,
+        "clinical_warnings": quality_dict.get("clinical_warnings", []),
+    }
+
+
 def _export_report_single(
     angles: dict,
     speed_m_s: float | None,
     fps: float,
     n_frames: int,
+    quality_grade: str,
     output_path: str,
 ) -> str:
-    """Export single-camera clinical report JSON."""
+    """Export single-camera movement analysis report JSON."""
     duration_s = n_frames / fps
 
-    # Step detection from ankle velocity
     def count_steps(arr):
         vel = np.diff(arr)
         signs = np.sign(vel)
@@ -508,6 +576,7 @@ def _export_report_single(
             "duration_s": round(duration_s, 2),
             "n_frames": n_frames,
         },
+        "tracking_quality_grade": quality_grade,
         "note": "No 3D reconstruction — use dual-camera mode for clinical-grade metrics",
         "gait_metrics": {
             "speed_m_s": speed_m_s,
@@ -515,21 +584,20 @@ def _export_report_single(
             "n_steps": int(total_steps),
         },
         "left_leg": {
-            "hip_rom_deg":  rom(angles.get("left_hip_angle", np.array([]))),
+            "hip_rom_deg": rom(angles.get("left_hip_angle", np.array([]))),
             "knee_rom_deg": rom(angles.get("left_knee_angle", np.array([]))),
             "ankle_rom_deg": rom(angles.get("left_ankle_angle", np.array([]))),
         },
         "right_leg": {
-            "hip_rom_deg":  rom(angles.get("right_hip_angle", np.array([]))),
+            "hip_rom_deg": rom(angles.get("right_hip_angle", np.array([]))),
             "knee_rom_deg": rom(angles.get("right_knee_angle", np.array([]))),
             "ankle_rom_deg": rom(angles.get("right_ankle_angle", np.array([]))),
         },
     }
 
-    import json as _json
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        _json.dump(report, f, indent=2)
+        json.dump(report, f, indent=2)
     return str(Path(output_path).resolve())
 
 
@@ -546,11 +614,12 @@ def run_session_dual(
     conf_threshold: float = 0.3,
     smooth_window: int = 7,
     output_dir: Path = None,
+    debug_overlay: bool = False,
 ) -> dict:
-    """Run full dual-camera 3D gait analysis."""
+    """Run full dual-camera 3D movement analysis."""
     session_id = session_dir.name
     start = datetime.now()
-    logger.info(f"=== GaitLab session (dual): {session_id} ===")
+    logger.info(f"=== Movement Analysis session (dual): {session_id} ===")
 
     # ── 1. Load calibration ──────────────────────────────────────────────────
     logger.info("Loading calibration...")
@@ -568,9 +637,25 @@ def run_session_dual(
     logger.info(f"  {n_frames} frames at {actual_fps:.1f} fps")
 
     # ── 3. 2D keypoint detection ─────────────────────────────────────────────
-    logger.info("Running MMPose 2D keypoint detection...")
-    kps_l, kps_r = detect_frames_dual(frames_l, frames_r, conf_threshold)
+    logger.info("Running pose detection...")
+    kps_l, kps_r, pd_l, pd_r = detect_frames_dual(frames_l, frames_r, conf_threshold)
     logger.info(f"  Detection complete: {n_frames} frame pairs")
+
+    raw_frames_l = [f for _, f in frames_l]
+    raw_frames_r = [f for _, f in frames_r]
+
+    # ── 3b. Tracking quality assessment ─────────────────────────────────────
+    # Use left camera frames as reference for quality
+    logger.info("Assessing tracking quality...")
+    if output_dir is None:
+        output_dir = session_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    quality_dict = _run_quality_assessment(
+        pd_l, raw_frames_l, output_dir,
+        debug_overlay=debug_overlay, fps=actual_fps,
+    )
+    quality_grade = quality_dict.get("quality_grade", "unknown")
 
     # ── 4. Triangulation to 3D ──────────────────────────────────────────────
     logger.info("Triangulating 3D trajectories...")
@@ -590,10 +675,6 @@ def run_session_dual(
     logger.info("  Angles computed: hip/knee/ankle/foot-progression")
 
     # ── 7. Export outputs ────────────────────────────────────────────────────
-    if output_dir is None:
-        output_dir = session_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     logger.info("Exporting outputs...")
     c3d_path = export_c3d(trajectories_smooth, actual_fps, str(output_dir / "session.c3d"))
     npz_path = export_trajectories_npz(trajectories_smooth, str(output_dir / "trajectories_3d.npz"))
@@ -605,6 +686,7 @@ def run_session_dual(
     logger.info(f"  C3D: {c3d_path}")
     logger.info(f"  CSV: {csv_path}")
     logger.info(f"  JSON: {json_path}")
+    logger.info(f"  Quality grade: {quality_grade}")
 
     return {
         "status": "success",
@@ -618,8 +700,11 @@ def run_session_dual(
             "npz": npz_path,
             "csv": csv_path,
             "report_json": json_path,
+            "tracking_quality_json": str(_quality_report_path(output_dir)),
         },
         "gait_metrics": angle_sum,
+        "tracking_quality_grade": quality_grade,
+        "clinical_warnings": quality_dict.get("clinical_warnings", []),
     }
 
 
@@ -637,6 +722,7 @@ def run_session(
     conf_threshold: float = 0.3,
     smooth_window: int = 7,
     output_dir: Path = None,
+    debug_overlay: bool = False,
 ) -> dict:
     """Unified entry point — dispatches to single or dual based on mode."""
     if mode == "single":
@@ -650,6 +736,7 @@ def run_session(
             conf_threshold=conf_threshold,
             smooth_window=smooth_window,
             output_dir=output_dir,
+            debug_overlay=debug_overlay,
         )
     elif mode == "dual":
         if video_l is None or video_r is None:
@@ -663,6 +750,7 @@ def run_session(
             conf_threshold=conf_threshold,
             smooth_window=smooth_window,
             output_dir=output_dir,
+            debug_overlay=debug_overlay,
         )
     else:
         raise ValueError(f"Unknown mode: {mode}. Use 'single' or 'dual'.")
@@ -674,8 +762,8 @@ def run_session(
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="GaitLab — markerless clinical gait analysis "
-                    "(supports single-camera and dual-camera modes)"
+        description="Movement Analysis — markerless dual/single-camera "
+                    "biomechanics pipeline"
     )
     p.add_argument("--session", required=True, help="Session directory")
     p.add_argument("--calibration", required=True, help="Calibration YAML file")
@@ -689,16 +777,54 @@ def build_parser():
                    help="[dual mode] Left camera video")
     p.add_argument("--right", dest="video_r", default=None,
                    help="[dual mode] Right camera video")
-    p.add_argument("--fps", type=float, default=None, help="Override FPS (auto-detect if None)")
-    p.add_argument("--conf-threshold", type=float, default=0.3, help="Min keypoint confidence 0-1")
-    p.add_argument("--smooth-window", type=int, default=7, help="SG smooth window (odd)")
+    p.add_argument("--fps", type=float, default=None, help="Override FPS")
+    p.add_argument("--conf-threshold", type=float, default=0.3,
+                   help="Min keypoint confidence 0-1")
+    p.add_argument("--smooth-window", type=int, default=7,
+                   help="SG smooth window (odd integer)")
     p.add_argument("--output", default=None, help="Output directory override")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING"])
+
+    # ── Pose backend args ──────────────────────────────────────────────────────
+    p.add_argument(
+        "--pose-backend", default=os.getenv("POSE_BACKEND", "auto"),
+        choices=["rtmpose", "yolo", "mediapipe", "auto"],
+        help="Pose detection backend (default: auto — RTMPose → YOLO → MediaPipe)"
+    )
+    p.add_argument(
+        "--pose-model-tier", default=os.getenv("POSE_MODEL_TIER", "balanced"),
+        choices=["fast", "balanced", "accurate"],
+        help="Model accuracy tier (default: balanced)"
+    )
+    p.add_argument(
+        "--pose-device", default=os.getenv("POSE_DEVICE", "cuda:0"),
+        help="Device for pose backend (e.g. cuda:0 or cpu)"
+    )
+    p.add_argument(
+        "--debug-overlay", action="store_true",
+        help="Generate debug_pose_overlay.mp4 with confidence coloring"
+    )
+    p.add_argument(
+        "--quality-report", action="store_true", default=True,
+        help="Produce tracking_quality.json (default: True)"
+    )
     return p
 
 
+# =============================================================================
+# main
+# =============================================================================
+
 def main():
     args = build_parser().parse_args()
+
+    # Propagate pose backend args → environment variables for _load_backend()
+    if args.pose_backend and args.pose_backend != "auto":
+        os.environ["POSE_BACKEND"] = args.pose_backend
+    if args.pose_model_tier:
+        os.environ["POSE_MODEL_TIER"] = args.pose_model_tier
+    if args.pose_device:
+        os.environ["POSE_DEVICE"] = args.pose_device
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -710,7 +836,6 @@ def main():
     session_dir.mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.output) if args.output else None
 
-    # Resolve video paths
     video_l = args.video or args.video_l
     video_r = args.video_r
 
@@ -727,6 +852,7 @@ def main():
         conf_threshold=args.conf_threshold,
         smooth_window=args.smooth_window,
         output_dir=output_dir,
+        debug_overlay=args.debug_overlay,
     )
 
     print("\n=== Session Report ===")
