@@ -6,6 +6,8 @@ __pycache__/
 venv/
 session*/output/
 *.task
+*.pt              # YOLO/pose model weights
+*.onnx            # ONNX models
 sessions/*/output/
 logs/
 videos/

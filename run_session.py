@@ -49,6 +49,7 @@ from keypoints.quality import (
     assess_frame,
     assess_session,
     assessment_to_dict,
+    FrameQuality,
     CRITICAL_JOINTS,
 )
 from keypoints.visualize import write_debug_video
@@ -362,24 +363,35 @@ def _run_quality_assessment(
             shape = raw_frames[i].shape if i < len(raw_frames) else (720, 1280, 3)
             fake_kps = np.full((17, 2), np.nan)
             fake_scores = np.zeros(17)
-            fq_dict = _compute_quality_frame(fake_kps, fake_scores, shape)
+            fq = assess_frame(fake_kps, fake_scores, shape)
         else:
-            fq_dict = _compute_quality_frame(pd.keypoints, pd.scores, pd.keypoints.shape)
+            fq = assess_frame(pd.keypoints, pd.scores, pd.keypoints.shape)
             # Count interpolated joints (score == 0 means NaN'd due to confidence)
             for j in range(17):
                 if pd.scores[j] == 0 and not np.isnan(pd.keypoints[j, 0]):
                     interpolation_counts[j] += 1
 
-        frame_qualities.append(fq_dict)
+        frame_qualities.append(fq)
 
     # Longest missing streak per joint
     total_frames = len(pose_detections)
     assessment = assess_session(frame_qualities, interpolation_counts, total_frames)
     assessment_dict = assessment_to_dict(assessment)
 
-    # Per-frame details
+    # Per-frame details (JSON-serializable)
     assessment_dict["frame_details"] = [
-        {**fq, "frame": i} for i, fq in enumerate(frame_qualities)
+        {
+            "frame": i,
+            "visible_ratio": round(fq.visible_ratio, 4),
+            "trunk_ratio": round(fq.trunk_ratio, 4),
+            "left_ll_ratio": round(fq.left_ll_ratio, 4),
+            "right_ll_ratio": round(fq.right_ll_ratio, 4),
+            "mean_ll_confidence": round(fq.mean_ll_confidence, 4),
+            "bbox_area_pct": round(fq.bbox_area_pct, 2),
+            "feet_outside_frame": fq.feet_outside_frame,
+            "low_ll_confidence": fq.low_ll_confidence,
+        }
+        for i, fq in enumerate(frame_qualities)
     ]
 
     # Write JSON

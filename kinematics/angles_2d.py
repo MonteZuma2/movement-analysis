@@ -107,10 +107,13 @@ def ankle_angle_2d(
     keypoints_seq: list[np.ndarray],
     side: str = "left",
 ) -> np.ndarray:
-    """Ankle dorsi/plantar flexion from 2D keypoints."""
+    """Ankle dorsi/plantar flexion from 2D keypoints.
+
+    Uses shank vector vs. vertical (gravity) as a proxy when no toe landmark
+    is available (YOLO-Pose COCO-17 has no toe/heel indices beyond ankle).
+    """
     knee_idx  = J[f"{side}_knee"]
     ankle_idx = J[f"{side}_ankle"]
-    toe_idx   = 15 if side == "left" else 16
 
     n = len(keypoints_seq)
     angles = np.full(n, np.nan)
@@ -118,11 +121,21 @@ def ankle_angle_2d(
     for f, kp in enumerate(keypoints_seq):
         knee  = kp[knee_idx]
         ankle = kp[ankle_idx]
-        toe   = kp[toe_idx]
 
         shank = _safe_vec2(knee, ankle)
-        foot  = _safe_vec2(ankle, toe)
-        angles[f] = _angle2(shank, foot)
+        if shank is None:
+            continue
+
+        # Vertical proxy: angle between shank and downward gravity vector (0, 1)
+        # This gives a simplified dorsi/plantar-flexion proxy without needing toe
+        shank_len = np.linalg.norm(shank)
+        if shank_len < 1e-6:
+            continue
+        shank_unit = shank / shank_len
+        # Vertical down: (0, 1)
+        vertical = np.array([0.0, 1.0])
+        cos_a = np.clip(np.dot(shank_unit, vertical), -1.0, 1.0)
+        angles[f] = np.arccos(cos_a) * 180.0 / np.pi
 
     return angles
 

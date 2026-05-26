@@ -11,10 +11,10 @@ Single: Video × 1 → 2D Pose → 2D Sagittal Angles + skeleton overlay + quali
 
 **Pose backends (pluggable):**
 
-| Backend | Description | Tier flag |
+| Backend | Description | Notes |
 |---|---|---|
-| **RTMPose** (default) | Two-stage detector-crop-pose; most accurate for difficult movements | `--pose-backend rtmpose` |
-| **YOLO-Pose** | Ultralytics single-stage pose; easy install, good fallback | `--pose-backend yolo` |
+| **YOLO-Pose** (default) | Ultralytics single-stage; COCO-17 native; full-body tracking including lower limbs | `--pose-backend yolo` |
+| **RTMPose** | Two-stage detector-crop-pose; most accurate for difficult movements | `--pose-backend rtmpose` |
 | **MediaPipe** | Legacy fallback; automatic if others unavailable | `--pose-backend mediapipe` |
 
 ---
@@ -28,9 +28,9 @@ Single: Video × 1 → 2D Pose → 2D Sagittal Angles + skeleton overlay + quali
 
 ### Single-camera (screening / gross assessment)
 - One camera in sagittal (side) view → pose estimation → 2D joint angles + skeleton overlay
-- Outputs: `angles.csv` + `report.json` + `skeleton.mp4` + `tracking_quality.json`
+- Outputs: `angles.csv` + `report.json` + `skeleton.mp4` + `tracking_quality.json` + optional `debug_pose_overlay.mp4`
 - No 3D reconstruction, no C3D export
-- Suitable for: screening, telehealth, squats, step-downs, jump landings
+- Suitable for: screening, telehealth, squats, step-downs, jump landings, lunges
 
 ---
 
@@ -42,17 +42,14 @@ cd /home/zuma/Documents/movement_analysis
 python -m venv .venv
 source .venv/bin/activate
 
-# Choose ONE of the following profiles:
-
-# Option A — RTMPose + OpenMMLab (preferred clinical backend)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install openmim mmengine "mmcv>=2.0" mmdet mmpose
-pip install opencv-python numpy scipy pyyaml ezc3d
-
-# Option B — YOLO-Pose (practical fallback, easier install)
+# YOLO-Pose — recommended, easiest install, best lower-limb tracking
 pip install ultralytics opencv-python numpy scipy pyyaml ezc3d
 
-# Option C — MediaPipe (legacy fallback, auto-used if others unavailable)
+# RTMPose — preferred clinical backend (requires torch + mmpose)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install openmim mmengine "mmcv>=2.0" mmdet mmpose
+
+# MediaPipe — legacy fallback
 pip install mediapipe opencv-python numpy scipy pyyaml ezc3d
 ```
 
@@ -62,13 +59,41 @@ pip install mediapipe opencv-python numpy scipy pyyaml ezc3d
 
 Use `--pose-model-tier` to control accuracy/speed tradeoff:
 
-| Flag | RTMPose | YOLO-Pose |
+| Flag | YOLO-Pose | RTMPose |
 |---|---|---|
-| `--pose-model-tier fast` | RTMPose-s (256×192) | yolo11s-pose.pt |
-| `--pose-model-tier balanced` (default) | RTMPose-l (256×192) | yolo11m-pose.pt |
-| `--pose-model-tier accurate` | RTMPose-x (384×288) | yolo11x-pose.pt |
+| `--pose-model-tier fast` | yolov8n-pose.pt | RTMPose-s (256×192) |
+| `--pose-model-tier balanced` (default) | yolov8s-pose.pt | RTMPose-l (256×192) |
+| `--pose-model-tier accurate` | yolov8m-pose.pt | RTMPose-x (384×288) |
 
-Device: `--pose-device cuda:0` (default) or `cpu`.
+Device: `--pose-device cpu` (default) or `cuda:0`.
+
+---
+
+## Quick start — single-camera (2D sagittal screening)
+
+```bash
+# YOLO-Pose is the recommended backend for full-body tracking
+python run_session.py \
+    --session sessions/lunge_001 \
+    --calibration calibration/intrinsics_demo.yaml \
+    --mode single \
+    --video "path/to/video.mov" \
+    --pose-backend yolo \
+    --pose-model-tier balanced \
+    --conf-threshold 0.25 \
+    --debug-overlay
+```
+
+For the included demo video (lunge):
+```bash
+python run_session.py \
+    --session sessions/lunge_test \
+    --calibration calibration/intrinsics_demo.yaml \
+    --mode single \
+    --video "/home/zuma/Movement Tracking project/Ant View Lunge Christina.MOV" \
+    --pose-backend yolo \
+    --debug-overlay
+```
 
 ---
 
@@ -121,29 +146,36 @@ python run_session.py \
     --mode single \
     --video videos/squat_side.mov \
     --pose-backend yolo \
-    --pose-model-tier fast \
+    --pose-model-tier balanced \
     --debug-overlay
 ```
 
-### All CLI options
+---
+
+## All CLI options
 
 ```
 --session <path>              Session output directory (required)
 --calibration <path>          Calibration YAML (required)
---mode single|dual            default: dual
---video <path>                [single] video file
---left <path>                 [dual] left camera video
---right <path>                [dual] right camera video
+--mode single|dual           default: dual
+
+# Single-camera
+--video <path>               Video file for single-camera mode
+
+# Dual-camera
+--left <path>                 Left camera video
+--right <path>                Right camera video
+
 --fps <float>                 Override video FPS (auto-detect if omitted)
---conf-threshold 0.3          Min keypoint confidence (0–1)
+--conf-threshold 0.25         Min keypoint confidence (0–1)
 --smooth-window 7             Savitzky-Golay smooth window (odd integer)
 --output <path>               Override output directory
---log-level INFO              DEBUG | INFO | WARNING
+--log-level INFO             DEBUG | INFO | WARNING
 
-# Pose backend options
+# Pose backend
 --pose-backend auto           auto | rtmpose | yolo | mediapipe (default: auto)
---pose-model-tier balanced   fast | balanced | accurate (default: balanced)
---pose-device cuda:0         cuda:0 or cpu
+--pose-model-tier balanced    fast | balanced | accurate (default: balanced)
+--pose-device cpu             cpu (default) or cuda:0
 --debug-overlay               Generate debug_pose_overlay.mp4 with confidence colors
 --quality-report              Produce tracking_quality.json (default: True)
 ```
@@ -210,26 +242,33 @@ movement_analysis/
 ├── keypoints/
 │   ├── __init__.py
 │   ├── detect.py                 # PoseDetection dataclass + façade + backend router
-│   ├── subject_selector.py       # Multi-person subject selection heuristic
+│   ├── subject_selector.py       # Multi-person primary subject heuristic
 │   ├── quality.py                # Per-frame + per-session tracking quality metrics
 │   ├── visualize.py              # Debug overlay renderer
 │   └── backends/
-│       ├── mediapipe_backend.py  # Legacy fallback
-│       ├── yolo_pose_backend.py  # Practical fallback
-│       └── rtmpose_backend.py   # Preferred clinical backend
+│       ├── mediapipe_backend.py  # Legacy fallback (manual path resolution for .tasks API)
+│       ├── yolo_pose_backend.py   # Ultralytics YOLO-Pose (COCO-17 native, recommended)
+│       └── rtmpose_backend.py    # OpenMMLab RTMPose (preferred clinical backend)
 │
 ├── calibration/
-│   └── calibrate.py             # Interactive checkerboard calibration
+│   ├── __init__.py
+│   ├── calibrate.py              # Interactive checkerboard calibration
+│   └── intrinsics_demo.yaml      # Demo intrinsics (no extrinsic/stereo)
+│
 ├── geometry/
 │   └── triangulate.py            # DLT triangulation, RANSAC, SG smoothing
+│
 ├── kinematics/
-│   ├── angles.py                # 3D joint angles (dual)
-│   ├── angles_2d.py              # 2D sagittal angles (single)
+│   ├── angles.py                 # 3D joint angles (dual-camera)
+│   ├── angles_2d.py              # 2D sagittal angles (single-camera)
 │   └── export.py                 # C3D, CSV, JSON report
-└── utils/
-    └── visualize.py             # Skeleton overlay renderer
+│
+├── utils/
+│   └── visualize.py              # Skeleton overlay renderer
+│
+└── sessions/                     # Per-session output (gitignored)
 ```
 
 ---
 
-*Last updated: May 2026 — v0.2*
+*Last updated: May 2026 — v1.0*

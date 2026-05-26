@@ -6,47 +6,63 @@ from keypoints.detect import PoseDetection
 
 
 class YoloPoseBackend:
-    """Ultralytics YOLO-Pose backend (practical fallback).
+    """Ultralytics YOLO-Pose backend — COCO-17 keypoints directly.
 
-    Returns 17 COCO keypoints directly with per-keypoint confidence.
+    YOLO-Pose outputs 17 COCO-format keypoints natively (no mapping needed).
+    Confidence is per-keypoint, set via conf threshold.
     """
 
-    def __init__(self, model_tier: str = "balanced", device: str = "cuda:0"):
+    def __init__(self, model_tier: str = "balanced", device: str = "cpu"):
         from ultralytics import YOLO
 
+        # yolov8n = nano (fastest), yolov8s = small, yolov8m = medium, yolov8x = xlarge
         model_map = {
-            "fast": "yolo11s-pose.pt",
-            "balanced": "yolo11m-pose.pt",
-            "accurate": "yolo11x-pose.pt",
+            "fast":     "yolov8n-pose.pt",
+            "balanced": "yolov8s-pose.pt",
+            "accurate": "yolov8m-pose.pt",
         }
-        self._model_name = model_map.get(model_tier, "yolo11m-pose.pt")
+        self._model_name = model_map.get(model_tier, "yolov8s-pose.pt")
         self._device = device
         self._model = YOLO(self._model_name)
 
     def detect(self, frame: np.ndarray, conf_threshold: float = 0.3):
-        results = self._model.predict(frame, conf=0.25, verbose=False, device=self._device)
-        if not results or results[0].keypoints is None or len(results[0].keypoints) == 0:
+        """Run pose detection on a single frame.
+
+        Returns PoseDetection with (17, 2) keypoints and (17,) confidence scores,
+        or None if no person detected above threshold.
+        """
+        results = self._model.predict(
+            frame, conf=conf_threshold, verbose=False, device=self._device
+        )
+        if not results or results[0].keypoints is None:
             return None
 
         r = results[0]
-        boxes = r.boxes.xyxy.detach().cpu().numpy()
-        box_scores = r.boxes.conf.detach().cpu().numpy()
-        kps_xy = r.keypoints.xy.detach().cpu().numpy()
-        kps_conf = r.keypoints.conf.detach().cpu().numpy()
+        xy = r.keypoints.xy     # (N, 17, 2)
+        conf = r.keypoints.conf  # (N, 17)
 
-        if len(boxes) == 0:
+        if xy.shape[0] == 0:
             return None
 
-        # Select largest high-confidence person
-        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        weights = areas * np.maximum(box_scores, 0.01)
-        idx = int(np.argmax(weights))
+        # Take the first (most confident) person
+        kps = xy[0].cpu().numpy()       # (17, 2) — pixel coords
+        scores = conf[0].cpu().numpy()   # (17,)
+
+        h, w = frame.shape[:2]
+        keypoints = kps.astype(np.float64)
+        valid = scores >= 0.0
+
+        if not valid.any():
+            return None
+
+        x_min, x_max = keypoints[valid, 0].min(), keypoints[valid, 0].max()
+        y_min, y_max = keypoints[valid, 1].min(), keypoints[valid, 1].max()
+        bbox = np.array([x_min, y_min, x_max, y_max], dtype=np.float64)
 
         return PoseDetection(
-            keypoints=kps_xy[idx].astype(np.float64),
-            scores=kps_conf[idx].astype(np.float64),
-            bbox=boxes[idx].astype(np.float64),
-            bbox_score=float(box_scores[idx]),
-            backend="yolo11-pose",
-            meta={"num_people": int(len(boxes)), "model": self._model_name},
+            keypoints=keypoints,
+            scores=scores.astype(np.float64),
+            bbox=bbox,
+            bbox_score=float(scores.max()),
+            backend="YOLO-Pose",
         )
